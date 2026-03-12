@@ -1,45 +1,92 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+compare_pdfs_extended.py
+
+Erweiterte Version des PDF-Dokumentenvergleichs mit vollständigem UTF‑8‑Support.
+Features:
+- PDF-Extraktion via PyPDF2
+- Struktur- & Inhaltsvergleich (Abschnitt → Absatz → Satz)
+- Ähnlichkeitsmetriken (Token‑Jaccard + SequenceMatcher)
+- Kopierte Passagen (Rolling Window, ≥ N Wörter)
+- CSV- und JSON-Exports
+- Markdown- UND HTML-Bericht (mit Inline-Highlighting für Änderungen)
+- Optional: Heatmap/Matrix der Similarities (matplotlib)
+- Optional: Regex-Highlighting für Schlüsselbegriffe
+
+Nutzung (Beispiel):
+    python compare_pdfs_extended.py \
+        --template file_1.pdf \
+        --changed file_2.pdf \
+        --segmentation auto \
+        --min_copy_words 50 \
+        --near_ratio 0.92 \
+        --regex "CISO" --regex "ACSMS" \
+        --heatmap \
+        --out_md diff_report.md \
+        --out_html diff_report.html \
+        --out_json diff_report.json
 
 """
-Dokumentenvergleich (Option 2 – format-/struktur-sensitiv) für zwei PDFs:
-- TEMPLATE (file_1.pdf)      -> Referenz
-- GEÄNDERTES DOKUMENT (file_2.pdf) -> Vergleich
-
-Ausgabe:
-- diff_report.md (Hauptbericht, Markdown)
-- diffs_added.csv / diffs_deleted.csv / diffs_modified.csv
-- copies_ge50w.csv (kopierte Passagen >= N Wörter)
-
-Ohne zusätzliche Internet-Abhängigkeiten. Benötigt: PyPDF2 (vorhanden).
-"""
+from __future__ import annotations
 
 import argparse
-import re
-import math
 import csv
+import json
+import re
 import hashlib
 import unicodedata
-from collections import defaultdict, namedtuple
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import List, Tuple, Dict, Iterable, Optional
 
 import PyPDF2
 
-# ---------------------------
-# Utility: kleine deutsche Stopwortliste (optional)
-# ---------------------------
+# Matplotlib ist optional (nur wenn --heatmap gesetzt)
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+except Exception:  # pragma: no cover
+    plt = None
+    np = None
+
+# ------------------------------
+# UTF-8 Normalisierung & Tokenizer
+# ------------------------------
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+    s = s.replace("\xad", "")             # Soft hyphen
+    s = s.replace("\u00A0", " ")           # NBSP
+    s = s.replace("\u2009", " ")            # Thin space
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+
+def tokens(s: str, stopwords: Optional[set] = None) -> List[str]:
+    s = normalize_text(s.lower())
+    s = re.sub(r"[^\wäöüÄÖÜß\-]+", " ", s)
+    tok = [t for t in s.split() if t]
+    if stopwords:
+        tok = [t for t in tok if t not in stopwords]
+    return tok
+
+
 DE_STOPWORDS = {
     "der","die","das","und","oder","aber","dass","daß","ist","sind","war","waren","ein","eine","einer","eines",
     "im","in","zu","vom","von","am","an","auf","für","mit","ohne","aus","als","auch","es","den","dem","des","sowie",
     "so","bei","durch","werden","wird","sich","nicht","nur","mehr","weniger"
 }
 
-# ---------------------------
-# PDF: Text extrahieren (pro Seite)
-# ---------------------------
+
+# ------------------------------
+# PDF Lesehilfe
+# ------------------------------
+
 def extract_pdf_text(path: str) -> List[str]:
-    pages = []
+    pages: List[str] = []
     with open(path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
         for p in reader.pages:
@@ -47,34 +94,37 @@ def extract_pdf_text(path: str) -> List[str]:
                 t = p.extract_text() or ""
             except Exception:
                 t = ""
-            # Normalisiere Zeilenenden
             t = t.replace("\r\n", "\n").replace("\r", "\n")
             pages.append(t)
     return pages
 
-# ---------------------------
-# Struktur-Erkennung: Überschriften / Abschnittsnummern / Tabellenblöcke
-# ---------------------------
-Header = namedtuple("Header", ["level", "title", "page_idx", "line_idx", "anchor"])
+
+# ------------------------------
+# Struktur-Erkennung
+# ------------------------------
+@dataclass
+class Header:
+    level: int
+    title: str
+    page_idx: int
+    line_idx: int
+    anchor: str
+
 
 HEADER_PATTERNS = [
-    # z.B. "1", "1.1", "2.3.4"
-    re.compile(r"^\s*(\d+(?:\.\d+){0,3})\s+([^\n]{3,})$"),
-    # Markdown-ähnliche (# Titel) kommt aus Export selten vor, lassen optional drin
-    re.compile(r"^\s*#{1,6}\s+(.+)$"),
-    # "Anhang A", "Annex A", optional
-    re.compile(r"^\s*(Anhang|Annex)\s+[A-Z]\b.*$")
+    re.compile(r"^\s*(\d+(?:\.\d+){0,3})\s+([^\n]{3,})$"),   # 1.2.3 Titel
+    re.compile(r"^\s*#{1,6}\s+(.+)$"),                         # Markdown-Header
+    re.compile(r"^\s*(Anhang|Annex)\s+[A-Z]\b.*$")            # Annex
 ]
 
+
 def detect_headers(pages: List[str]) -> List[Header]:
-    headers = []
+    headers: List[Header] = []
     for pi, page in enumerate(pages):
         for li, line in enumerate(page.split("\n")):
             stripped = line.strip()
             if not stripped:
                 continue
-            matched = False
-            # Abschnittsnummern
             m = HEADER_PATTERNS[0].match(stripped)
             if m:
                 num = m.group(1)
@@ -83,207 +133,124 @@ def detect_headers(pages: List[str]) -> List[Header]:
                 anchor = f"{num} {title}"
                 headers.append(Header(level, anchor, pi, li, anchor))
                 continue
-            # Markdown-Header
             m = HEADER_PATTERNS[1].match(stripped)
             if m:
                 title = m.group(1).strip()
-                level = 1
-                anchor = title
-                headers.append(Header(level, anchor, pi, li, anchor))
+                headers.append(Header(1, title, pi, li, title))
                 continue
-            # Annex
             m = HEADER_PATTERNS[2].match(stripped)
             if m:
-                level = 1
-                anchor = stripped
-                headers.append(Header(level, anchor, pi, li, anchor))
+                headers.append(Header(1, stripped, pi, li, stripped))
                 continue
     return headers
 
-# ---------------------------
-# Tabellen-Erkennung (heuristisch): viele Spalten-Trenner, Bullet/Cell-Muster etc.
-# ---------------------------
-def is_table_like_block(lines: List[str], tolerance: float = 0.75) -> bool:
-    """
-    Sehr einfache Heuristik:
-    - viele Zeilen mit mehreren "Spaltenmerkmalen" (z. B. 2+ Räume, |, Tabs)
-    - Prozent der Zeilen, die "tabellarisch" wirken, muss >= tolerance
-    """
-    if not lines:
-        return False
-    tableish = 0
-    for ln in lines:
-        l = ln.strip()
-        if not l:
-            continue
-        # Spaltenindikatoren: mehrere Spaces / Pipes / Tabs
-        # oder häufige "Spalten-Header"-Wörter (Version, Datum, Beschreibung, ...)
-        if (l.count("  ") >= 1) or ("\t" in l) or ("│" in l) or ("|" in l):
-            tableish += 1
-            continue
-        if re.search(r"\bVersion\b|\bDatum\b|\bBeschreibung\b|\bBehandlungszeitraum\b", l, re.I):
-            tableish += 1
-    ratio = tableish / max(1, len(lines))
-    return ratio >= tolerance
 
-# ---------------------------
-# Segmentierung: Abschnitt -> Absatz -> Satz (hierarchisch)
-# ---------------------------
-Segment = namedtuple("Segment", ["section_path", "paragraph_idx", "sentence_idx", "text", "page_span"])
+# ------------------------------
+# Segmentierung (Abschnitt -> Absatz -> Satz)
+# ------------------------------
+@dataclass
+class Segment:
+    section_path: str
+    paragraph_idx: int
+    sentence_idx: int
+    text: str
+    page_span: Tuple[int, int]
+
 
 def split_sentences(text: str) -> List[str]:
-    # einfache Satzsegmentierung auf Deutsch (heuristisch)
-    # Punkte in Abkürzungen werden grob ignoriert, dennoch robust
     text = text.replace("…", ".")
-    # Trenne auf . ! ? gefolgt von Leerzeichen/Zeilenende, aber nicht bei Nummerierungen "1.2.3"
-    # Grobe Heuristik:
-    candidates = re.split(r"(?<=[^\d][\.\!\?])\s+", text.strip())
-    # Cleanup
-    out = []
-    for c in candidates:
-        s = c.strip()
-        if s:
-            out.append(s)
-    return out
+    parts = re.split(r"(?<=[^\d][\.!\?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
-def segment_document(pages: List[str], mode: str = "auto", table_tol: float = 0.75) -> List[Segment]:
-    """
-    mode:
-      - 'section'    : segmentiert nur nach Überschriften, innerhalb als ein Block
-      - 'paragraph'  : pro Absatz
-      - 'sentence'   : pro Satz
-      - 'auto'       : Abschnitt -> Absatz -> Satz (liefert feinste Segmente mit Strukturpfad)
-    """
+
+def segment_document(pages: List[str], mode: str = "auto") -> List[Segment]:
     headers = detect_headers(pages)
     header_map = {(h.page_idx, h.line_idx): h for h in headers}
 
-    # Dokument zu Zeilen mit (page_idx, line_idx)
     lines_by_page = [pg.split("\n") for pg in pages]
-
-    # Abschnitts-Pfade bauen
     segments: List[Segment] = []
     current_path: List[str] = []
 
     def current_section_path() -> str:
         return " / ".join(current_path) if current_path else "ROOT"
 
+    def flush_buffer(buf: List[str], page_ix: int):
+        if not buf:
+            return
+        block = "\n".join(buf).strip()
+        if not block:
+            return
+        paras = [p for p in re.split(r"\n\s*\n", block) if p.strip()]
+        para_idx = 0
+        for p in paras:
+            if mode == "section":
+                segments.append(Segment(current_section_path(), para_idx, -1, normalize_text(p), (page_ix, page_ix)))
+                para_idx += 1
+                continue
+            if mode == "paragraph":
+                segments.append(Segment(current_section_path(), para_idx, -1, normalize_text(p), (page_ix, page_ix)))
+                para_idx += 1
+                continue
+            # sentence/auto
+            sents = split_sentences(p)
+            for si, s in enumerate(sents):
+                segments.append(Segment(current_section_path(), para_idx, si, normalize_text(s), (page_ix, page_ix)))
+            para_idx += 1
+
     for pi, lines in enumerate(lines_by_page):
         buf: List[str] = []
-        para_idx = 0
-        sent_idx_global = 0
-
-        def flush_buffer_as_segments():
-            nonlocal buf, para_idx, sent_idx_global
-            if not buf:
-                return
-            block = "\n".join(buf).strip()
-            if not block:
-                buf = []
-                return
-            # Absatzsplitting
-            paragraphs = [p for p in re.split(r"\n\s*\n", block) if p.strip()]
-            if mode == "section":
-                # gesamter Block als 1 Segment
-                seg = Segment(current_section_path(), para_idx, -1, block, (pi, pi))
-                segments.append(seg)
-                para_idx += 1
-                buf = []
-                return
-
-            for p in paragraphs:
-                p_clean = p.strip()
-                if not p_clean:
-                    continue
-                if mode == "paragraph":
-                    seg = Segment(current_section_path(), para_idx, -1, p_clean, (pi, pi))
-                    segments.append(seg)
-                    para_idx += 1
-                    continue
-                # sentence / auto
-                sents = split_sentences(p_clean)
-                for si, s in enumerate(sents):
-                    seg = Segment(current_section_path(), para_idx, si, s, (pi, pi))
-                    segments.append(seg)
-                    sent_idx_global += 1
-                para_idx += 1
-            buf = []
-
         for li, ln in enumerate(lines):
-            # Wechsel bei Überschrift?
             if (pi, li) in header_map:
-                # bisherigen Puffer flushen
-                flush_buffer_as_segments()
-                # neue Überschrift setzen
+                flush_buffer(buf, pi)
+                buf = []
                 h = header_map[(pi, li)]
-                # Level basierte Hierarchie
                 while len(current_path) >= h.level:
                     current_path.pop()
                 current_path.append(h.title)
                 continue
             buf.append(ln)
-
-        # Seitenende flush
-        flush_buffer_as_segments()
+        flush_buffer(buf, pi)
 
     return segments
 
-# ---------------------------
-# Normalisierung / Tokenisierung
-# ---------------------------
-def normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFC", s)
-    s = s.replace("\xad", "")
-    s = s.replace("\u2009", " ").replace("\u00A0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
 
-def tokens(s: str, stopwords: Optional[set] = None) -> List[str]:
-    s = normalize_text(s.lower())
-    # entferne einfache Interpunktion
-    s = re.sub(r"[^\wäöüÄÖÜß\-]+", " ", s)
-    toks = [t for t in s.split() if t]
-    if stopwords:
-        toks = [t for t in toks if t not in stopwords]
-    return toks
-
-# ---------------------------
+# ------------------------------
 # Ähnlichkeitsmetriken
-# ---------------------------
+# ------------------------------
+
 def jaccard_similarity(a: Iterable[str], b: Iterable[str]) -> float:
     A = set(a); B = set(b)
     if not A and not B:
         return 1.0
     return len(A & B) / max(1, len(A | B))
 
+
 def seq_ratio(a: str, b: str) -> float:
     return SequenceMatcher(a=a, b=b).ratio()
 
+
 def composite_similarity(a_text: str, b_text: str, stopwords: Optional[set]) -> float:
-    # Mischung: 50% Token-Jaccard, 50% SequenceMatcher
     a_toks = tokens(a_text, stopwords)
     b_toks = tokens(b_text, stopwords)
     jac = jaccard_similarity(a_toks, b_toks)
-    sm = seq_ratio(normalize_text(a_text), normalize_text(b_text))
-    return 0.5*jac + 0.5*sm
+    sm = seq_ratio(a_text, b_text)
+    return 0.5 * jac + 0.5 * sm
 
-# ---------------------------
-# Segment-Matching (Greedy Best Match pro Segment im Template)
-# ---------------------------
-def match_segments(template: List[Segment], changed: List[Segment],
-                   stopwords: Optional[set], near_ratio: float = 0.92
-                   ) -> Tuple[List[Tuple[Segment, Segment, float]],
-                              List[Segment], List[Segment]]:
-    matched_pairs = []
-    unmatched_template = []
+
+# ------------------------------
+# Segment-Matching (greedy)
+# ------------------------------
+
+def match_segments(template: List[Segment], changed: List[Segment], stopwords: Optional[set], min_sim: float = 0.35) -> Tuple[List[Tuple[Segment, Segment, float]], List[Segment], List[Segment]]:
+    matched_pairs: List[Tuple[Segment, Segment, float]] = []
+    unmatched_template: List[Segment] = []
     unmatched_changed = set(range(len(changed)))
 
-    # Index über „section_path“ für grobe Vorauswahl (gleiche Sektion bevorzugt)
-    idx_by_section: Dict[str, List[int]] = defaultdict(list)
+    idx_by_section: Dict[str, List[int]] = {}
     for i, seg in enumerate(changed):
-        idx_by_section[seg.section_path].append(i)
+        idx_by_section.setdefault(seg.section_path, []).append(i)
 
     for tseg in template:
-        # Kandidaten: gleiche Sektion zuerst, sonst gesamte Menge
         cand_idx = idx_by_section.get(tseg.section_path, list(range(len(changed))))
         best_i = None
         best_sim = -1.0
@@ -294,82 +261,76 @@ def match_segments(template: List[Segment], changed: List[Segment],
             if sim > best_sim:
                 best_sim = sim
                 best_i = i
-        if best_i is not None and best_sim >= 0.35:  # minimale Ähnlichkeit für Match
+        if best_i is not None and best_sim >= min_sim:
             matched_pairs.append((tseg, changed[best_i], best_sim))
-            if best_i in unmatched_changed:
-                unmatched_changed.remove(best_i)
+            unmatched_changed.remove(best_i)
         else:
             unmatched_template.append(tseg)
 
     unmatched_changed_list = [changed[i] for i in sorted(unmatched_changed)]
     return matched_pairs, unmatched_template, unmatched_changed_list
 
-# ---------------------------
-# Kopierte Passagen >= N Wörter (Rolling Hash über Wörter)
-# ---------------------------
-def find_copied_passages(template: List[Segment], changed: List[Segment],
-                         min_words: int = 50, stopwords: Optional[set] = None,
-                         near_ratio: float = 0.92) -> List[Dict]:
-    """
-    Sucht längere (nahezu) identische Passagen über Segmentgrenzen.
-    Heuristik: baue Wortfenster über zusammenhängende Segmente.
-    """
-    def flatten(seg_list: List[Segment]) -> List[Tuple[str, Tuple[int,int], str]]:
-        # Rückgabe: [(text, page_span, locator), ...]
+
+# ------------------------------
+# Kopierte Passagen (Rolling Window)
+# ------------------------------
+
+def find_copied_passages(template: List[Segment], changed: List[Segment], min_words: int = 50, near_ratio: float = 0.92) -> List[Dict]:
+    def flatten(seg_list: List[Segment]) -> List[Tuple[str, str]]:
         out = []
         for s in seg_list:
             locator = f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}"
-            out.append((s.text, s.page_span, locator))
+            out.append((s.text, locator))
         return out
 
     A = flatten(template)
     B = flatten(changed)
 
-    # Erzeuge Wortlisten (ohne Stopwörter, aber mit Reihenfolge) je Eintrag
     def word_list(t: str) -> List[str]:
-        return tokens(t, stopwords=None)  # Für Kopien Erkennung: keine Stopwort-Filterung
+        return tokens(t, stopwords=None)  # keine Stopwörter bei Kopien
 
-    # Rolling Matches
-    results = []
-    # Erzeuge „Dokument“-Wortströme (vermindertes Risiko von Satzgrenzenverlusten)
-    A_stream = []
-    A_index_to_meta = []
-    for ai, (t, pg, loc) in enumerate(A):
+    A_stream: List[str] = []
+    A_index_meta: List[Tuple[int, str]] = []  # (end_offset, locator)
+    for (t, loc) in A:
         w = word_list(t)
-        for wi, _ in enumerate(w):
-            A_stream.append(w[wi])
-        A_index_to_meta.append((len(A_stream), loc))  # Endoffset + locator
+        A_stream.extend(w)
+        A_index_meta.append((len(A_stream), loc))
 
-    B_stream = []
-    B_index_to_meta = []
-    for bi, (t, pg, loc) in enumerate(B):
+    B_stream: List[str] = []
+    B_index_meta: List[Tuple[int, str]] = []
+    for (t, loc) in B:
         w = word_list(t)
-        for wi, _ in enumerate(w):
-            B_stream.append(w[wi])
-        B_index_to_meta.append((len(B_stream), loc))
+        B_stream.extend(w)
+        B_index_meta.append((len(B_stream), loc))
 
-    # Hash Maps: Fenster aus A
+    results: List[Dict] = []
     win = min_words
     if len(A_stream) < win or len(B_stream) < win:
         return results
 
     def windows(words: List[str], size: int) -> Dict[str, List[int]]:
-        mp = defaultdict(list)
+        mp: Dict[str, List[int]] = {}
         for i in range(0, len(words) - size + 1):
             chunk = " ".join(words[i:i+size])
             h = hashlib.sha1(chunk.encode("utf-8")).hexdigest()
-            mp[h].append(i)
+            mp.setdefault(h, []).append(i)
         return mp
 
     A_wins = windows(A_stream, win)
-    # Scanne B und prüfe Hashtreffer, erweitere anschließend nach links/rechts
+
+    # Helper zur Lokalisierung
+    def loc_from_offset(meta_index: List[Tuple[int, str]], offset: int) -> str:
+        for end_off, loc in meta_index:
+            if offset <= end_off:
+                return loc
+        return meta_index[-1][1]
+
     for j in range(0, len(B_stream) - win + 1):
         chunk = " ".join(B_stream[j:j+win])
         h = hashlib.sha1(chunk.encode("utf-8")).hexdigest()
         if h not in A_wins:
             continue
         for i in A_wins[h]:
-            # expandiere Match
             left = 0
             while i-1-left >= 0 and j-1-left >= 0 and A_stream[i-1-left] == B_stream[j-1-left]:
                 left += 1
@@ -380,33 +341,20 @@ def find_copied_passages(template: List[Segment], changed: List[Segment],
             length = win + left + right
             A_text = " ".join(A_stream[i-left:i+win+right])
             B_text = " ".join(B_stream[j-left:j+win+right])
-            # Ähnlichkeitsprüfung (leichte Toleranz)
             r = seq_ratio(A_text, B_text)
             if r >= near_ratio:
-                # Lokalisierung grob anhand Endoffsets
-                # (Für Bericht: nur Locator-Strings aus Segmenten)
-                # Finde ungefähre Abschnitt/Absatz anhand nächster Marker
-                def loc_from_offset(meta_index, offset):
-                    for end_off, loc in meta_index:
-                        if offset <= end_off:
-                            return loc
-                    return meta_index[-1][1]
-
-                a_loc = loc_from_offset(A_index_to_meta, i)
-                b_loc = loc_from_offset(B_index_to_meta, j)
                 results.append({
-                    "template_locator": a_loc,
-                    "changed_locator": b_loc,
+                    "template_locator": loc_from_offset(A_index_meta, i),
+                    "changed_locator": loc_from_offset(B_index_meta, j),
                     "words": length,
                     "similarity": round(r, 4),
                     "excerpt_template": A_text[:800] + ("…" if len(A_text) > 800 else ""),
                     "excerpt_changed": B_text[:800] + ("…" if len(B_text) > 800 else "")
                 })
-    # Zusammenführen sehr nahe beieinander liegende Treffer könnte ergänzt werden
-    # (hier: direkt Roh-Ergebnisse)
-    # Dedup nach template_locator + changed_locator + words
+
+    # Dedup sortiert nach Länge/Similarität
     seen = set()
-    dedup = []
+    dedup: List[Dict] = []
     for r in sorted(results, key=lambda x: (-x["words"], -x["similarity"])):
         key = (r["template_locator"], r["changed_locator"], r["words"])
         if key in seen:
@@ -415,221 +363,329 @@ def find_copied_passages(template: List[Segment], changed: List[Segment],
         dedup.append(r)
     return dedup
 
-# ---------------------------
-# Haupt-Workflow
-# ---------------------------
-def build_report(template_pdf: str,
-                 changed_pdf: str,
-                 segmentation: str = "auto",
-                 min_copy_words: int = 50,
-                 stop_lang: Optional[str] = "de",
-                 near_ratio: float = 0.92,
-                 table_tol: float = 0.75,
-                 out_md: str = "diff_report.md"):
+
+# ------------------------------
+# HTML-Diff Utilities
+# ------------------------------
+
+def highlight_ops(a: str, b: str) -> Tuple[str, float]:
+    """Markiert Wort-Änderungen zwischen a und b mit <span>-Tags.
+    Rückgabe: (html_string, similarity_ratio)
+    """
+    a_t = tokens(a, stopwords=None)
+    b_t = tokens(b, stopwords=None)
+    sm = SequenceMatcher(a=a_t, b=b_t)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            out.append(' '.join(b_t[j1:j2]))
+        elif tag == 'insert':
+            out.append('<span class="ins">' + ' '.join(b_t[j1:j2]) + '</span>')
+        elif tag == 'delete':
+            out.append('<span class="del">' + ' '.join(a_t[i1:i2]) + '</span>')
+        elif tag == 'replace':
+            out.append('<span class="rep">' + ' '.join(b_t[j1:j2]) + '</span>')
+    ratio = sm.ratio()
+    return ' '.join(out), ratio
+
+
+# ------------------------------
+# Reporting
+# ------------------------------
+
+def write_csv(path: str, rows: List[Dict], fieldnames: List[str]):
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def write_json(path: str, data: Dict):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def build_markdown(global_sim_pct: int, jac: float, avg_pair_sim: float, struct_overlap: float,
+                   copies: List[Dict], deleted: List[Segment], added: List[Segment], modified: List[Tuple[Segment, Segment, float]],
+                   min_copy_words: int) -> str:
+    md = []
+    md.append('# Diff‑Bericht (Erweiterte Version)')
+    md.append('')
+    md.append('## 1) Ähnlichkeitsgrad')
+    md.append(f'- **Gesamte Übereinstimmung**: **{global_sim_pct}%**')
+    md.append(f'    - Token‑Jaccard: {jac:.3f} | Ø‑Match‑Ähnlichkeit: {avg_pair_sim:.3f} | Struktur‑Overlap: {struct_overlap:.3f}')
+
+    md.append('\n## 2) Kopierte Textabschnitte (≥ Mindestlänge)')
+    if copies:
+        md.append('| # | Locator (Template) | Locator (Geändert) | Wörter | Ähnlichkeit |')
+        md.append('|---:|---|---|---:|---:|')
+        for i, r in enumerate(copies, 1):
+            md.append(f"| {i} | {r['template_locator']} | {r['changed_locator']} | {r['words']} | {r['similarity']:.3f} |")
+    else:
+        md.append('> Keine kopierten Abschnitte gemäß Schwellwert gefunden.')
+
+    md.append('\n## 3) Änderungen')
+    md.append('### 3.1 Gelöschter Text aus Template (Auszug)')
+    if deleted:
+        md.append('| # | Position | Auszug |')
+        md.append('|---:|---|---|')
+        for i, s in enumerate(deleted[:50], 1):
+            excerpt = (s.text[:240] + '…') if len(s.text) > 240 else s.text
+            pos = f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}"
+            md.append(f"| {i} | {pos} | {excerpt} |")
+        if len(deleted) > 50:
+            md.append(f"\n> **{len(deleted)-50} weitere…** siehe CSV.")
+    else:
+        md.append('> Nichts ausschließlich im Template gefunden.')
+
+    md.append('\n### 3.2 Neu hinzugefügter Text im geänderten Dokument (Auszug)')
+    if added:
+        md.append('| # | Position | Auszug |')
+        md.append('|---:|---|---|')
+        for i, s in enumerate(added[:50], 1):
+            excerpt = (s.text[:240] + '…') if len(s.text) > 240 else s.text
+            pos = f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}"
+            md.append(f"| {i} | {pos} | {excerpt} |")
+        if len(added) > 50:
+            md.append(f"\n> **{len(added)-50} weitere…** siehe CSV.")
+    else:
+        md.append('> Keine exklusiven Ergänzungen gefunden.')
+
+    md.append('\n### 3.3 Geänderte Segmente (Vorher ↔ Nachher, Auszug)')
+    if modified:
+        md.append('| # | Position (Template) | Position (Geändert) | Ähnlichkeit | Vorher (Auszug) | Nachher (Auszug) |')
+        md.append('|---:|---|---|---:|---|---|')
+        for i, (tseg, cseg, sim) in enumerate(modified[:50], 1):
+            before = (tseg.text[:160] + '…') if len(tseg.text) > 160 else tseg.text
+            after  = (cseg.text[:160] + '…') if len(cseg.text) > 160 else cseg.text
+            pos_t  = f"{tseg.section_path} :: Abs.{tseg.paragraph_idx}{'' if tseg.sentence_idx<0 else f'/Satz {tseg.sentence_idx+1}'}"
+            pos_c  = f"{cseg.section_path} :: Abs.{cseg.paragraph_idx}{'' if cseg.sentence_idx<0 else f'/Satz {cseg.sentence_idx+1}'}"
+            md.append(f"| {i} | {pos_t} | {pos_c} | {sim:.3f} | {before} | {after} |")
+        if len(modified) > 50:
+            md.append(f"\n> **{len(modified)-50} weitere…** siehe CSV.")
+    else:
+        md.append('> Keine geänderten Segmente.')
+
+    md.append('\n## 4) Zusammenfassung')
+    md.append(f"- **Gesamte Übereinstimmung**: **{global_sim_pct}%**")
+    md.append(f"- **Kopierte Abschnitte**: {len(copies)} (≥ {min_copy_words} Wörter)")
+    md.append(f"- **Gelöscht**: {len(deleted)} | **Hinzugefügt**: {len(added)} | **Geändert**: {len(modified)}")
+
+    return "\n".join(md)
+
+
+def build_html(title: str, modified: List[Tuple[Segment, Segment, float]], regexes: List[re.Pattern]) -> str:
+    css = """
+    <style>
+    body {font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; line-height: 1.45;}
+    h1,h2,h3 {margin-top: 1.2em}
+    table {border-collapse: collapse; width: 100%;}
+    td,th {border: 1px solid #ddd; padding: 6px; vertical-align: top;}
+    tr:nth-child(even){background:#fafafa}
+    .ins {background: #e6ffed;}
+    .del {background: #ffeef0; text-decoration: line-through;}
+    .rep {background: #fff5b1;}
+    .hlre {background: #dbeafe; border-radius: 3px; padding: 0 2px;}
+    .sim {font-variant-numeric: tabular-nums;}
+    </style>
+    """
+    html = ["<html><head><meta charset='utf-8'>", f"<title>{title}</title>", css, "</head><body>"]
+    html.append(f"<h1>{title}</h1>")
+    html.append("<h2>Geänderte Segmente (inline Diff)</h2>")
+    html.append("<table><thead><tr><th>#</th><th>Vorher (Template)</th><th>Nachher (Geändert)</th><th>Ähnlichkeit</th></tr></thead><tbody>")
+
+    def apply_regex_highlights(text: str) -> str:
+        out = text
+        for rx in regexes:
+            out = rx.sub(lambda m: f"<span class='hlre'>{m.group(0)}</span>", out)
+        return out
+
+    for i, (tseg, cseg, sim) in enumerate(modified, 1):
+        t_html, _ = highlight_ops(tseg.text, tseg.text)   # identisch, nur Regex-Highlighting möglich
+        c_html, _ = highlight_ops(tseg.text, cseg.text)
+        t_html = apply_regex_highlights(t_html)
+        c_html = apply_regex_highlights(c_html)
+        html.append(
+            f"<tr><td>{i}</td><td>{t_html}</td><td>{c_html}</td><td class='sim'>{sim:.3f}</td></tr>"
+        )
+    html.append("</tbody></table>")
+    html.append("</body></html>")
+    return "".join(html)
+
+
+# ------------------------------
+# Hauptworkflow
+# ------------------------------
+
+def build_reports(template_pdf: str, changed_pdf: str,
+                  segmentation: str,
+                  min_copy_words: int,
+                  near_ratio: float,
+                  use_stopwords: bool,
+                  regex_list: List[str],
+                  want_heatmap: bool,
+                  out_md: str,
+                  out_html: str,
+                  out_json: str,
+                  report_title: str):
 
     # 1) PDF lesen
     t_pages = extract_pdf_text(template_pdf)
     c_pages = extract_pdf_text(changed_pdf)
 
     # 2) Segmente bilden
-    t_segs = segment_document(t_pages, mode=segmentation, table_tol=table_tol)
-    c_segs = segment_document(c_pages, mode=segmentation, table_tol=table_tol)
+    stopwords = DE_STOPWORDS if use_stopwords else None
+    t_segs = segment_document(t_pages, mode=segmentation)
+    c_segs = segment_document(c_pages, mode=segmentation)
 
-    # 3) Stopwörter wählen
-    stopwords = DE_STOPWORDS if (stop_lang == "de") else None
+    # 3) Matching
+    pairs, t_only, c_only = match_segments(t_segs, c_segs, stopwords)
+    modified = [(t, c, s) for (t, c, s) in pairs if s < near_ratio]
 
-    # 4) Segment-Matching
-    pairs, t_only, c_only = match_segments(t_segs, c_segs, stopwords, near_ratio=near_ratio)
+    # 4) Kopien
+    copies = find_copied_passages(t_segs, c_segs, min_words=min_copy_words, near_ratio=near_ratio)
 
-    # 5) Einstufung: gelöscht / hinzugefügt / geändert
-    deleted = []
-    added = []
-    modified = []
-
-    for seg in t_only:
-        deleted.append(seg)
-
-    for seg in c_only:
-        added.append(seg)
-
-    for tseg, cseg, sim in pairs:
-        # "Geändert", wenn Text nicht (nahezu) identisch
-        if sim < near_ratio:
-            modified.append((tseg, cseg, sim))
-
-    # 6) Kopien >= min_words
-    copies = find_copied_passages(t_segs, c_segs, min_words=min_copy_words,
-                                  stopwords=None, near_ratio=near_ratio)
-
-    # 7) Globaler Ähnlichkeitsgrad (gewichtete Mischung)
-    #    - Wort-Jaccard gesamt
-    #    - Satzähnlichkeit gemittelt über Matches
-    #    - Struktur-Overlap (gleiche section_path Vorkommen)
-    t_all = "\n".join([s.text for s in t_segs])
-    c_all = "\n".join([s.text for s in c_segs])
-
+    # 5) Ähnlichkeit (global)
+    t_all = "\n".join(s.text for s in t_segs)
+    c_all = "\n".join(s.text for s in c_segs)
     jac = jaccard_similarity(tokens(t_all, stopwords), tokens(c_all, stopwords))
-    if pairs:
-        avg_pair_sim = sum(sim for _, _, sim in pairs) / len(pairs)
-    else:
-        avg_pair_sim = 0.0
+    avg_pair_sim = (sum(s for (_, _, s) in pairs) / len(pairs)) if pairs else 0.0
     t_sections = set(s.section_path for s in t_segs)
     c_sections = set(s.section_path for s in c_segs)
     struct_overlap = len(t_sections & c_sections) / max(1, len(t_sections | c_sections))
-
-    # Gewichtung (kann bei Bedarf angepasst werden)
     global_sim = 0.4*jac + 0.4*avg_pair_sim + 0.2*struct_overlap
     global_sim_pct = int(round(100*global_sim))
 
-    # 8) Exporte (CSV) + Markdown-Bericht
-    def write_csv(path: str, rows: List[Dict[str, str]], fieldnames: List[str]):
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
-
-    # CSV: added / deleted / modified / copies
+    # 6) CSV Exports
     write_csv("diffs_deleted.csv", [
-        {
-            "Position (Template)": f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}",
-            "Text (Template)": s.text
-        } for s in deleted
-    ], ["Position (Template)", "Text (Template)"])
+        {"Position": f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}",
+         "Text": s.text}
+        for s in t_only
+    ], ["Position","Text"])
 
     write_csv("diffs_added.csv", [
-        {
-            "Position (Geändert)": f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}",
-            "Text (Geändert)": s.text
-        } for s in added
-    ], ["Position (Geändert)", "Text (Geändert)"])
+        {"Position": f"{s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'}",
+         "Text": s.text}
+        for s in c_only
+    ], ["Position","Text"])
 
     write_csv("diffs_modified.csv", [
-        {
-            "Position (Template)": f"{t.section_path} :: Abs.{t.paragraph_idx}{'' if t.sentence_idx<0 else f'/Satz {t.sentence_idx+1}'}",
-            "Position (Geändert)": f"{c.section_path} :: Abs.{c.paragraph_idx}{'' if c.sentence_idx<0 else f'/Satz {c.sentence_idx+1}'}",
-            "Ähnlichkeit (0-1)": f"{sim:.4f}",
-            "Vorher (Template)": t.text,
-            "Nachher (Geändert)": c.text
-        } for (t, c, sim) in modified
-    ], ["Position (Template)", "Position (Geändert)", "Ähnlichkeit (0-1)", "Vorher (Template)", "Nachher (Geändert)"])
+        {"Template": f"{t.section_path} :: Abs.{t.paragraph_idx}{'' if t.sentence_idx<0 else f'/Satz {t.sentence_idx+1}'}",
+         "Geändert": f"{c.section_path} :: Abs.{c.paragraph_idx}{'' if c.sentence_idx<0 else f'/Satz {c.sentence_idx+1}'}",
+         "Ähnlichkeit(0-1)": f"{sim:.4f}",
+         "Vorher": t.text,
+         "Nachher": c.text}
+        for (t, c, sim) in modified
+    ], ["Template","Geändert","Ähnlichkeit(0-1)","Vorher","Nachher"])
 
-    write_csv("copies_ge50w.csv", [
-        {
-            "Locator (Template)": r["template_locator"],
-            "Locator (Geändert)": r["changed_locator"],
-            "Wortanzahl": r["words"],
-            "Ähnlichkeit (0-1)": r["similarity"],
-            "Zitat (Template, gekürzt)": r["excerpt_template"],
-            "Zitat (Geändert, gekürzt)": r["excerpt_changed"]
-        } for r in copies
-    ], ["Locator (Template)", "Locator (Geändert)", "Wortanzahl", "Ähnlichkeit (0-1)",
-        "Zitat (Template, gekürzt)", "Zitat (Geändert, gekürzt)"])
+    write_csv("copies_geN.csv", [
+        {"Locator(Template)": r["template_locator"],
+         "Locator(Geändert)": r["changed_locator"],
+         "Wörter": r["words"],
+         "Ähnlichkeit(0-1)": r["similarity"],
+         "Zitat(Template,gekürzt)": r["excerpt_template"],
+         "Zitat(Geändert,gekürzt)": r["excerpt_changed"]}
+        for r in copies
+    ], ["Locator(Template)","Locator(Geändert)","Wörter","Ähnlichkeit(0-1)","Zitat(Template,gekürzt)","Zitat(Geändert,gekürzt)"])
 
-    # Markdown-Tabellen (kompakt, nicht alle Zeilen – für Details CSV öffnen)
-    md = []
-    md.append("# Diff‑Bericht (TEMPLATE = file_1.pdf, GEÄNDERT = file_2.pdf)\n")
-    md.append("## 1) Ähnlichkeitsgrad\n")
-    md.append(f"- **Gesamte Übereinstimmung**: **{global_sim_pct}%**\n")
-    md.append(f"    - Token‑Jaccard: {jac:.3f} | Ø‑Satzähnlichkeit (Matches): {avg_pair_sim:.3f} | Struktur‑Overlap: {struct_overlap:.3f}\n")
+    # 7) Markdown
+    md = build_markdown(global_sim_pct, jac, avg_pair_sim, struct_overlap, copies, t_only, c_only, modified, min_copy_words)
+    with open(out_md, 'w', encoding='utf-8') as f:
+        f.write(md)
 
-    # Kopien
-    md.append("\n## 2) Kopierte Textabschnitte (≥ Mindestlänge)\n")
-    if copies:
-        md.append("| # | Locator (Template) | Locator (Geändert) | Wörter | Ähnlichkeit |")
-        md.append("|---:|---|---|---:|---:|")
-        for i, r in enumerate(copies, 1):
-            md.append(f"| {i} | {r['template_locator']} | {r['changed_locator']} | {r['words']} | {r['similarity']:.3f} |")
-        md.append("\n> *Vollständige Zitate in* `copies_ge50w.csv`.\n")
-    else:
-        md.append("> Keine kopierten Abschnitte gemäß Schwellwert gefunden.\n")
+    # 8) HTML (mit Regex-Highlighting)
+    compiled_regexes = []
+    for r in regex_list:
+        try:
+            compiled_regexes.append(re.compile(r, re.IGNORECASE))
+        except re.error:
+            pass
+    html = build_html(report_title, modified, compiled_regexes)
+    with open(out_html, 'w', encoding='utf-8') as f:
+        f.write(html)
 
-    # Gelöscht / Hinzugefügt
-    md.append("\n## 3) Änderungen\n")
-    md.append("### 3.1 Gelöschter Text aus Template\n")
-    if deleted:
-        md.append("| # | Position (Template) | Auszug |")
-        md.append("|---:|---|---|")
-        for i, s in enumerate(deleted[:50], 1):
-            excerpt = (s.text[:240] + "…") if len(s.text) > 240 else s.text
-            md.append(f"| {i} | {s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'} | {excerpt} |")
-        if len(deleted) > 50:
-            md.append(f"\n> **{len(deleted)-50} weitere…** Details in `diffs_deleted.csv`.")
-    else:
-        md.append("> Kein ausschließlich im Template vorhandener Text.\n")
+    # 9) JSON
+    json_obj = {
+        "similarity": {
+            "global_pct": global_sim_pct,
+            "token_jaccard": round(jac, 4),
+            "avg_pair": round(avg_pair_sim, 4),
+            "struct_overlap": round(struct_overlap, 4)
+        },
+        "counts": {
+            "deleted": len(t_only),
+            "added": len(c_only),
+            "modified": len(modified),
+            "copied": len(copies)
+        }
+    }
+    write_json(out_json, json_obj)
 
-    md.append("\n### 3.2 Neu hinzugefügter Text im geänderten Dokument\n")
-    if added:
-        md.append("| # | Position (Geändert) | Auszug |")
-        md.append("|---:|---|---|")
-        for i, s in enumerate(added[:50], 1):
-            excerpt = (s.text[:240] + "…") if len(s.text) > 240 else s.text
-            md.append(f"| {i} | {s.section_path} :: Abs.{s.paragraph_idx}{'' if s.sentence_idx<0 else f'/Satz {s.sentence_idx+1}'} | {excerpt} |")
-        if len(added) > 50:
-            md.append(f"\n> **{len(added)-50} weitere…** Details in `diffs_added.csv`.")
-    else:
-        md.append("> Kein ausschließlich im geänderten Dokument vorhandener Text.\n")
+    # 10) Heatmap (optional, einfache Similarity-Matrix der ersten N Segmente)
+    if want_heatmap and plt is not None and np is not None:
+        N = min(80, max(1, len(t_segs)))
+        M = min(80, max(1, len(c_segs)))
+        # Stichprobe / Truncation, um Laufzeit zu begrenzen
+        sim_mat = np.zeros((N, M), dtype=float)
+        for i in range(N):
+            for j in range(M):
+                sim_mat[i, j] = composite_similarity(t_segs[i].text, c_segs[j].text, stopwords)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(sim_mat, cmap='viridis', aspect='auto', vmin=0, vmax=1)
+        ax.set_title('Similarity Heatmap (Teilmatrix)')
+        ax.set_xlabel('Geänderte Segmente (Index)')
+        ax.set_ylabel('Template Segmente (Index)')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        plt.savefig('diff_heatmap.png', dpi=150)
+        plt.close(fig)
 
-    md.append("\n### 3.3 Geänderte Sätze/Absätze (Vorher ↔ Nachher)\n")
-    if modified:
-        md.append("| # | Position (Template) | Position (Geändert) | Ähnlichkeit | Vorher (Template) | Nachher (Geändert) |")
-        md.append("|---:|---|---|---:|---|---|")
-        for i, (tseg, cseg, sim) in enumerate(modified[:50], 1):
-            before = (tseg.text[:180] + "…") if len(tseg.text) > 180 else tseg.text
-            after  = (cseg.text[:180] + "…") if len(cseg.text) > 180 else cseg.text
-            pos_t  = f"{tseg.section_path} :: Abs.{tseg.paragraph_idx}{'' if tseg.sentence_idx<0 else f'/Satz {tseg.sentence_idx+1}'}"
-            pos_c  = f"{cseg.section_path} :: Abs.{cseg.paragraph_idx}{'' if cseg.sentence_idx<0 else f'/Satz {cseg.sentence_idx+1}'}"
-            md.append(f"| {i} | {pos_t} | {pos_c} | {sim:.3f} | {before} | {after} |")
-        if len(modified) > 50:
-            md.append(f"\n> **{len(modified)-50} weitere…** Details in `diffs_modified.csv`.")
-    else:
-        md.append("> Keine partiell geänderten Segmente (alle Matches nahezu identisch oder nur hinzugefügt/gelöscht).\n")
+    print(f"[OK] Reports erzeugt: {out_md}, {out_html}, {out_json}")
+    print("     CSVs: diffs_added.csv, diffs_deleted.csv, diffs_modified.csv, copies_geN.csv")
+    if want_heatmap:
+        if plt is None:
+            print("[HINWEIS] Heatmap angefordert, aber matplotlib/numpy nicht verfügbar.")
+        else:
+            print("     Heatmap: diff_heatmap.png")
 
-    # Zusammenfassung
-    md.append("\n## 4) Zusammenfassung\n")
-    md.append(f"- **Gesamte Übereinstimmung**: **{global_sim_pct}%**\n")
-    md.append(f"- **Kopierte Abschnitte (≥ {min_copy_words} Wörter)**: {len(copies)}\n")
-    md.append(f"- **Gelöscht**: {len(deleted)} | **Hinzugefügt**: {len(added)} | **Geändert**: {len(modified)}\n")
-    md.append("\n**Hinweis:** Detaillierte Diffs und Zitate siehe die erzeugten CSV‑Dateien.\n")
 
-    with open(path, "w", encoding="utf-8", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-
-    print(f"[OK] Bericht geschrieben: {out_md}")
-    print(f"     CSVs: diffs_added.csv, diffs_deleted.csv, diffs_modified.csv, copies_ge50w.csv")
-    print(f"     Übereinstimmung gesamt: {global_sim_pct}%")
-
-# ---------------------------
+# ------------------------------
 # CLI
-# ---------------------------
+# ------------------------------
+
 def main():
-    ap = argparse.ArgumentParser(description="PDF-Dokumentenvergleich (Option 2, format-/struktur-sensitiv).")
-    ap.add_argument("--template", required=True, help="Pfad zum Template-PDF (file_1.pdf).")
-    ap.add_argument("--changed", required=True, help="Pfad zum geänderten PDF (file_2.pdf).")
-    ap.add_argument("--segmentation", choices=["auto","section","paragraph","sentence"], default="auto",
-                    help="Segmentierungsmodus (default: auto = Abschnitt→Absatz→Satz).")
-    ap.add_argument("--min_copy_words", type=int, default=50,
-                    help="Mindestlänge kopierter Passagen in Wörtern (default: 50).")
-    ap.add_argument("--stopwords", choices=["none","de"], default="de",
-                    help="Stopwort-Set für Metriken (default: de).")
-    ap.add_argument("--near_ratio", type=float, default=0.92,
-                    help="Schwelle für 'nahezu identisch' (default: 0.92).")
-    ap.add_argument("--table_tolerance", type=float, default=0.75,
-                    help="Empfindlichkeit der Tabellenheuristik (unused in report, reserviert).")
-    ap.add_argument("--out", default="diff_report.md", help="Pfad für die Markdown-Ausgabe.")
+    ap = argparse.ArgumentParser(description='Erweiterter PDF-Vergleich (UTF-8, HTML, CSV/JSON, Heatmap, Regex-Highlight).')
+    ap.add_argument('--template', required=True, help='Template PDF (ältere Version)')
+    ap.add_argument('--changed', required=True, help='Geändertes PDF (neue Version)')
+    ap.add_argument('--segmentation', choices=['auto','section','paragraph','sentence'], default='auto', help='Segmentierungsmodus (default: auto)')
+    ap.add_argument('--min_copy_words', type=int, default=50, help='Mindestlänge kopierter Passagen in Wörtern (default: 50)')
+    ap.add_argument('--near_ratio', type=float, default=0.92, help='Schwelle für "nahezu identisch" (default: 0.92)')
+    ap.add_argument('--stopwords', choices=['none','de'], default='de', help='Stopwort-Set (default: de)')
+    ap.add_argument('--regex', action='append', default=[], help='Regex-Begriff(e) zum Hervorheben (mehrfach nutzbar)')
+    ap.add_argument('--heatmap', action='store_true', help='Erzeuge zusätzlich eine Similarity-Heatmap (diff_heatmap.png)')
+    ap.add_argument('--out_md', default='diff_report.md', help='Pfad zur Markdown-Ausgabe')
+    ap.add_argument('--out_html', default='diff_report.html', help='Pfad zur HTML-Ausgabe')
+    ap.add_argument('--out_json', default='diff_report.json', help='Pfad zur JSON-Zusammenfassung')
+    ap.add_argument('--title', default='PDF‑Diff Bericht (Erweitert)', help='Titel für HTML-Bericht')
     args = ap.parse_args()
 
-    stop_lang = None if args.stopwords == "none" else "de"
-    build_report(
+    use_stop = (args.stopwords == 'de')
+
+    build_reports(
         template_pdf=args.template,
         changed_pdf=args.changed,
         segmentation=args.segmentation,
         min_copy_words=args.min_copy_words,
-        stop_lang=stop_lang,
         near_ratio=args.near_ratio,
-        table_tol=args.table_tolerance,
-        out_md=args.out
+        use_stopwords=use_stop,
+        regex_list=args.regex,
+        want_heatmap=args.heatmap,
+        out_md=args.out_md,
+        out_html=args.out_html,
+        out_json=args.out_json,
+        report_title=args.title
     )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
